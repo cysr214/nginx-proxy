@@ -11,6 +11,7 @@
 - [HTTP/2 and HTTP/3](#http2-and-http3)
 - [Headers](#headers)
 - [Custom Nginx Configuration](#custom-nginx-configuration)
+- [TCP and UDP stream](#tcp-and-udp-stream)
 - [Unhashed vs SHA1 upstream names](#unhashed-vs-sha1-upstream-names)
 - [Separate Containers](#separate-containers)
 - [Docker Compose](#docker-compose)
@@ -52,6 +53,105 @@ For each host defined into `VIRTUAL_HOST`, the associated virtual port is retrie
 1. From the `VIRTUAL_PORT` environment variable
 1. From the container's exposed port if there is only one
 1. From the default port 80 when none of the above methods apply
+
+### Multiple ports
+
+If your container expose more than one service on different ports and those services need to be proxied, you'll need to use the `VIRTUAL_HOST_MULTIPORTS` environment variable. This variable takes virtual host, path, port and dest definition in YAML (or JSON) form, and completely override the `VIRTUAL_HOST`, `VIRTUAL_PORT`, `VIRTUAL_PATH` and `VIRTUAL_DEST` environment variables on this container.
+
+The YAML syntax should be easier to write on Docker compose files, while the JSON syntax can be used for CLI invocation.
+
+The expected format is the following:
+
+```yaml
+hostname:
+  path:
+    port: int
+    dest: string
+```
+
+For each hostname entry, `path`, `port` and `dest` are optional and are assigned default values when missing:
+
+- `path` = "/"
+- `port` = default port
+- `dest` = ""
+
+The following examples use an hypothetical container running services on port 80, 8000 and 9000:
+
+#### Multiple ports routed to different hostnames
+
+```yaml
+services:
+  multiport-container:
+    image: somerepo/somecontainer
+    container_name: multiport-container
+    environment:
+      VIRTUAL_HOST_MULTIPORTS: |-
+        www.example.org:
+        service1.example.org:
+          "/":
+            port: 8000
+        service2.example.org:
+          "/":
+            port: 9000
+
+# There is no path dict specified for www.example.org, so it get the default values:
+# www.example.org:
+#   "/":
+#     port: 80 (default port)
+#     dest: ""
+
+# JSON equivalent:
+#     VIRTUAL_HOST_MULTIPORTS: |-
+#       {
+#         "www.example.org": {},
+#         "service1.example.org": { "/": { "port": 8000, "dest": "" } },
+#         "service2.example.org": { "/": { "port": 9000, "dest": "" } }
+#       }
+```
+
+This would result in the following proxy config:
+
+- `www.example.org` -> `multiport-container:80`
+- `service1.example.org` -> `multiport-container:8000`
+- `service2.example.org` -> `multiport-container:9000`
+
+#### Multiple ports routed to same hostname and different paths
+
+```yaml
+services:
+  multiport-container:
+    image: somerepo/somecontainer
+    container_name: multiport-container
+    environment:
+      VIRTUAL_HOST_MULTIPORTS: |-
+        www.example.org:
+          "/":
+          "/service1":
+            port: 8000
+            dest: "/"
+          "/service2":
+            port: 9000
+            dest: "/"
+
+# port and dest are not specified on the / path, so this path is routed
+# to the default port with the default dest value (empty string)
+
+# JSON equivalent:
+#     VIRTUAL_HOST_MULTIPORTS: |-
+#       {
+#         "www.example.org": {
+#           "/": {},
+#           "/service1": { "port": 8000, "dest": "/" },
+#           "/service2": { "port": 9000, "dest": "/" }
+#         }
+#       }
+```
+
+This would result in the following proxy config:
+
+- `www.example.org` -> `multiport-container:80`
+- `www.example.org/service1` -> `multiport-container:8000`
+- `www.example.org/service2` -> `multiport-container:9000`
 
 ⬆️ [back to table of contents](#table-of-contents)
 
@@ -321,6 +421,12 @@ If you are running the container in a virtualized environment (Hyper-V, VirtualB
 
 [acme-companion](https://github.com/nginx-proxy/acme-companion) is a lightweight companion container for the nginx-proxy. It allows the automated creation/renewal of SSL certificates using the ACME protocol.
 
+By default nginx-proxy generates location blocks to handle ACME HTTP Challenge. This behavior can be changed with environment variable `ACME_HTTP_CHALLENGE_LOCATION`. It accepts these values:
+
+- `true`: default behavior, handle ACME HTTP Challenge in all cases.
+- `false`: do not handle ACME HTTP Challenge at all.
+- `legacy`: legacy behavior for compatibility with older (<= `2.3`) versions of acme-companion, only handle ACME HTTP challenge when there is a certificate for the domain and `HTTPS_METHOD=redirect`.
+
 ### Diffie-Hellman Groups
 
 [RFC7919 groups](https://datatracker.ietf.org/doc/html/rfc7919#appendix-A) with key lengths of 2048, 3072, and 4096 bits are [provided by `nginx-proxy`](https://github.com/nginx-proxy/nginx-proxy/dhparam). The ENV `DHPARAM_BITS` can be set to `2048` or `3072` to change from the default 4096-bit key. The DH key file will be located in the container at `/etc/nginx/dhparam/dhparam.pem`. Mounting a different `dhparam.pem` file at that location will override the RFC7919 key.
@@ -472,7 +578,11 @@ _WARNING_: HSTS will force your users to visit the HTTPS version of your site fo
 
 ### Missing Certificate
 
-If HTTPS is enabled for a virtual host but its certificate is missing, nginx-proxy will configure nginx to use the default certificate (`default.crt` with `default.key`) and return a 500 error.
+If no matching certificate is found for a given virtual host, nginx-proxy will:
+
+- configure nginx to use the default certificate (`default.crt` with `default.key`) and return a 500 error for HTTPS,
+- force enable HTTP; i.e. `HTTPS_METHOD` will switch to `noredirect` if it was set to `nohttp` or `redirect`.
+  If this switch to HTTP is not wanted set `ENABLE_HTTP_ON_MISSING_CERT=false` (default is `true`).
 
 If the default certificate is also missing, nginx-proxy will configure nginx to accept HTTPS connections but fail the TLS negotiation. Client browsers will render a TLS error page. As of March 2023, web browsers display the following error messages:
 
@@ -696,6 +806,76 @@ location / {
 ### Per-VIRTUAL_HOST `server_tokens` configuration
 
 Per virtual-host `servers_tokens` directive can be configured by passing appropriate value to the `SERVER_TOKENS` environment variable. Please see the [nginx http_core module configuration](https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens) for more details.
+
+### Custom error page
+
+To override the default error page displayed on 50x errors, mount your custom HTML error page inside the container at `/usr/share/nginx/html/errors/50x.html`:
+
+```console
+docker run --detach \
+    --name nginx-proxy \
+    --publish 80:80 \
+    --volume /var/run/docker.sock:/tmp/docker.sock:ro \
+    --volume /path/to/error.html:/usr/share/nginx/html/errors/50x.html:ro \
+    nginxproxy/nginx-proxy
+```
+
+Note that this will not replace your own services error pages.
+
+⬆️ [back to table of contents](#table-of-contents)
+
+## TCP and UDP stream
+
+If you want to proxy non-HTTP traffic, you can use nginx's stream module. Write a configuration file and mount it inside `/etc/nginx/toplevel.conf.d`.
+
+```nginx
+# stream.conf
+stream {
+    upstream stream_backend {
+        server backend1.example.com:12345;
+        server backend2.example.com:12345;
+        server backend3.example.com:12346;
+        # ...
+    }
+    server {
+        listen     12345;
+        #TCP traffic will be forwarded to the "stream_backend" upstream group
+        proxy_pass stream_backend;
+    }
+
+    server {
+        listen     12346;
+        #TCP traffic will be forwarded to the specified server
+        proxy_pass backend.example.com:12346;
+    }
+
+    upstream dns_servers {
+        server 192.168.136.130:53;
+        server 192.168.136.131:53;
+        # ...
+    }
+    server {
+        listen     53 udp;
+        #UDP traffic will be forwarded to the "dns_servers" upstream group
+        proxy_pass dns_servers;
+    }
+    # ...
+}
+```
+
+```console
+docker run --detach \
+    --name nginx-proxy \
+    --publish 80:80 \
+    --publish 12345:12345 \
+    --publish 12346:12346 \
+    --publish 53:53:udp \
+    --volume /var/run/docker.sock:/tmp/docker.sock:ro \
+    --volume ./stream.conf:/etc/nginx/toplevel.conf.d/stream.conf:ro \
+    nginxproxy/nginx-proxy
+```
+
+Please note that TCP and UDP stream are not core features of nginx-proxy, so the above is provided as an example only, without any guarantee.
 
 ⬆️ [back to table of contents](#table-of-contents)
 
